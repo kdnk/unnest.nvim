@@ -7,6 +7,12 @@ g.loaded_unnest = true
 env.VISUAL = v.progpath
 env.EDITOR = v.progpath
 
+-- Ensure server is started to get current socket path (v.servername)
+-- This also sets NVIM environment variable for child processes
+if v.servername == '' then
+	vim.fn.serverstart()
+end
+
 api.nvim_create_user_command("UnnestEdit", function(cmd)
 	require("unnest").ex_edit(cmd)
 end, {
@@ -15,29 +21,130 @@ end, {
 	complete = "shellcmdline",
 })
 
-if not env.NVIM then
+--- Get ancestor PIDs of the current process
+--- @return table pids List of ancestor PIDs
+local function get_ancestor_pids()
+	local pids = {}
+	local current_pid = vim.fn.getpid()
+
+	-- Trace parent processes up to init (PID 1)
+	while current_pid and current_pid > 1 do
+		local result = vim.fn.system('ps -o ppid= -p ' .. current_pid)
+		local ppid = tonumber(vim.trim(result))
+		if not ppid or ppid <= 1 then
+			break
+		end
+		table.insert(pids, ppid)
+		current_pid = ppid
+	end
+
+	return pids
+end
+
+--- Extract PID from socket path (e.g., "/path/nvim.12345.0" -> 12345)
+--- @param socket_path string
+--- @return number|nil pid
+local function get_pid_from_socket(socket_path)
+	local pid = socket_path:match('nvim%.(%d+)%.%d+$')
+	return pid and tonumber(pid) or nil
+end
+
+--- Find an available parent Neovim socket to connect to
+--- Prioritizes sockets whose PID is an ancestor of current process
+--- @return number|nil parent_chan The channel number if successful
+--- @return string|nil socket_path The socket path if successful
+local function find_parent_socket()
+	local current_socket = v.servername
+	local ancestor_pids = get_ancestor_pids()
+
+	-- Get user socket directory: /var/folders/.../nvim.{user}
+	local user_dir = vim.fn.fnamemodify(current_socket, ':h:h')
+
+	-- Find all socket files in the user directory
+	local sockets = vim.fn.globpath(user_dir, '*/nvim.*.0', false, true)
+
+	-- Build list of valid parent sockets, categorized by whether they're ancestors
+	local ancestor_parents = {}
+	local other_parents = {}
+
+	for _, socket in ipairs(sockets) do
+		if socket ~= current_socket then
+			local socket_pid = get_pid_from_socket(socket)
+
+			local success, chan = pcall(vim.fn.sockconnect, "pipe", socket, { rpc = true })
+			if success and chan and chan > 0 then
+				-- Check if the parent has unnest plugin
+				local has_unnest_success, has_unnest = pcall(
+					vim.fn.rpcrequest,
+					chan,
+					'nvim_exec_lua',
+					'return pcall(require, "unnest")',
+					{}
+				)
+				if has_unnest_success and has_unnest then
+					local mtime = vim.fn.getftime(socket)
+					local parent_info = { socket = socket, chan = chan, mtime = mtime, pid = socket_pid }
+
+					-- Check if this socket's PID is an ancestor
+					local is_ancestor = false
+					for _, ancestor_pid in ipairs(ancestor_pids) do
+						if socket_pid == ancestor_pid then
+							is_ancestor = true
+							break
+						end
+					end
+
+					if is_ancestor then
+						table.insert(ancestor_parents, parent_info)
+					else
+						table.insert(other_parents, parent_info)
+					end
+				else
+					vim.fn.chanclose(chan)
+				end
+			end
+		end
+	end
+
+	-- Prefer ancestor parents, then fall back to other parents
+	local candidates = #ancestor_parents > 0 and ancestor_parents or other_parents
+
+	if #candidates == 0 then
+		return nil, nil
+	end
+
+	-- Sort by modification time (newest first) within the chosen category
+	table.sort(candidates, function(a, b)
+		return a.mtime > b.mtime
+	end)
+
+	-- Close all channels except the selected one
+	local selected = candidates[1]
+	for i = 2, #candidates do
+		vim.fn.chanclose(candidates[i].chan)
+	end
+
+	-- Also close channels from the non-selected category
+	local non_selected = #ancestor_parents > 0 and other_parents or ancestor_parents
+	for _, parent in ipairs(non_selected) do
+		vim.fn.chanclose(parent.chan)
+	end
+
+	return selected.chan, selected.socket
+end
+
+local parent_chan, parent_socket = find_parent_socket()
+
+if not parent_chan then
 	return
 end
 
-local success, result = pcall(vim.fn.sockconnect, "pipe", env.NVIM, { rpc = true })
-local parent_chan = success and result or 0
-
-if not success or not parent_chan or parent_chan == 0 then
-	io.stderr:write("Nvim failed to connect to parent: " .. tostring(result) .. "\n")
-	vim.cmd("qall!")
-end
 
 local parent = require("unnest.nvim"):new(parent_chan)
-local parent_has_unnest = parent.nvim_exec_lua("return pcall(require, 'unnest')", {})
-
---- Don't load this plugin if the parent Nvim doesn't have this plugin.
-if not parent_has_unnest then
-	vim.fn.chanclose(parent_chan)
-	return
-end
 
 api.nvim_create_autocmd("VimEnter", {
 	callback = function()
+
 		if env.NVIM_UNNEST_NOWAIT then
 			parent.rpcnotify.nvim_cmd({
 				cmd = "edit",
@@ -61,6 +168,7 @@ api.nvim_create_autocmd("VimEnter", {
 		end
 
 		local tabpagenr = parent.nvim_call_function("tabpagenr", {}) --[[@as integer]]
+
 		parent.rpcnotify.nvim_create_autocmd("TabClosed", {
 			command = ([[if expand("<afile>") == %s | call rpcnotify(sockconnect('pipe', '%s', #{ rpc: v:true }), 'nvim_command', 'quitall!') | endif]]):format(
 				tabpagenr,
