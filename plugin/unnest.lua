@@ -30,6 +30,10 @@ local function get_ancestor_pids()
 	-- Trace parent processes up to init (PID 1)
 	while current_pid and current_pid > 1 do
 		local result = vim.fn.system('ps -o ppid= -p ' .. current_pid)
+		-- Check if command failed (non-zero exit code)
+		if vim.v.shell_error ~= 0 then
+			break
+		end
 		local ppid = tonumber(vim.trim(result))
 		if not ppid or ppid <= 1 then
 			break
@@ -57,11 +61,11 @@ local function find_parent_socket()
 	local current_socket = v.servername
 	local ancestor_pids = get_ancestor_pids()
 
-	-- Get user socket directory: /var/folders/.../nvim.{user}
-	local user_dir = vim.fn.fnamemodify(current_socket, ':h:h')
+	-- Get socket base directory: /var/folders/.../nvim.{user}
+	local socket_base_dir = vim.fn.fnamemodify(current_socket, ':h:h')
 
-	-- Find all socket files in the user directory
-	local sockets = vim.fn.globpath(user_dir, '*/nvim.*.0', false, true)
+	-- Find all socket files in the socket base directory
+	local sockets = vim.fn.globpath(socket_base_dir, '*/nvim.*.0', false, true)
 
 	-- Build list of valid parent sockets, categorized by whether they're ancestors
 	local ancestor_parents = {}
@@ -136,6 +140,8 @@ end
 local parent_chan, parent_socket = find_parent_socket()
 
 if not parent_chan then
+	-- This is expected when running Neovim outside of :terminal or
+	-- when no parent Neovim instance with unnest plugin is found
 	return
 end
 
